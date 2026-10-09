@@ -1,0 +1,403 @@
+Attribute VB_Name = "PhoneCleanerModule"
+Option Explicit
+
+' =====================================================================
+' Phone Number Cleaner for Microsoft Word
+'
+' Converts entries such as:
+'   C:210-790-0232 (07/01/2025)
+'   (210) 853-9648 (CT) (M) (90%) [Feedback]
+' to:
+'   (210) 790-0232
+'   (210) 853-9648
+'
+' Setup (one time):
+'   1. Turn on: File > Options > Trust Center > Trust Center Settings >
+'      Macro Settings > "Trust access to the VBA project object model"
+'   2. Run BuildPhoneCleanerForm once. This creates the pop-up form.
+'   3. You may turn the trust setting back off afterward.
+'
+' Daily use:
+'   Run PhoneCleaner (assign it to the Quick Access Toolbar if you like).
+' =====================================================================
+
+Private Const FORM_NAME As String = "frmPhoneCleaner"
+Private Const DEFAULT_STATUS As String = _
+    "Click in the report where the list should go, then click Insert."
+
+' ---------------------------------------------------------------------
+' Opens the Phone Cleaner pop-up (modeless, so you can click the document)
+' ---------------------------------------------------------------------
+Public Sub PhoneCleaner()
+    Dim f As Object
+
+    For Each f In VBA.UserForms
+        If f.Name = FORM_NAME Then
+            f.Show vbModeless
+            Exit Sub
+        End If
+    Next f
+
+    On Error GoTo NotBuilt
+    VBA.UserForms.Add(FORM_NAME).Show vbModeless
+    Exit Sub
+
+NotBuilt:
+    MsgBox "The Phone Cleaner form has not been built yet." & vbCrLf & _
+           "Run BuildPhoneCleanerForm once first.", vbExclamation, "Phone Cleaner"
+End Sub
+
+' ---------------------------------------------------------------------
+' One-time setup: builds the pop-up form
+' ---------------------------------------------------------------------
+Public Sub BuildPhoneCleanerForm()
+    Dim proj As Object
+    Dim comp As Object
+    Dim frm As Object
+    Dim code As String
+    Dim testCount As Long
+
+    On Error Resume Next
+    Set proj = MacroContainer.VBProject
+    testCount = proj.VBComponents.Count
+    If Err.Number <> 0 Or proj Is Nothing Then
+        On Error GoTo 0
+        MsgBox "Word is blocking access to the VBA project." & vbCrLf & vbCrLf & _
+               "Go to File > Options > Trust Center > Trust Center Settings > " & _
+               "Macro Settings and check ""Trust access to the VBA project object model""." & _
+               vbCrLf & "Then run this macro again.", vbExclamation, "Phone Cleaner"
+        Exit Sub
+    End If
+    On Error GoTo 0
+
+    For Each comp In proj.VBComponents
+        If comp.Name = FORM_NAME Then
+            MsgBox "The form already exists. To rebuild it, remove " & FORM_NAME & _
+                   " in the VBA editor (right-click > Remove) and run this again.", _
+                   vbInformation, "Phone Cleaner"
+            Exit Sub
+        End If
+    Next comp
+
+    Set comp = proj.VBComponents.Add(3) ' 3 = UserForm
+    comp.Name = FORM_NAME
+    comp.Properties("Caption") = "Phone Number Cleaner"
+    comp.Properties("Width") = 424
+    comp.Properties("Height") = 382
+    comp.Properties("ShowModal") = False
+
+    Set frm = comp.Designer
+
+    AddLabel frm, "lblInput", "Paste raw phone numbers below (any format, one or many per line):", 6, 6, 404, 12
+    AddTextBox frm, "txtInput", 6, 20, 404, 110
+
+    AddButton frm, "cmdClean", "Clean Numbers", 6, 136, 132, 24
+    AddButton frm, "cmdClear", "Clear All", 142, 136, 132, 24
+    AddButton frm, "cmdClose", "Close", 278, 136, 132, 24
+
+    AddLabel frm, "lblPhones", "Cleaned phone numbers:", 6, 168, 404, 12
+    AddTextBox frm, "txtPhones", 6, 182, 404, 110
+
+    AddButton frm, "cmdInsertPhones", "Insert Phone Numbers at Cursor", 6, 298, 404, 24
+
+    AddLabel frm, "lblStatus", DEFAULT_STATUS, 6, 328, 404, 24
+
+    code = EventSub("cmdClean", "PC_Clean Me") & _
+           EventSub("cmdClear", "PC_Clear Me") & _
+           EventSub("cmdClose", "Unload Me") & _
+           EventSub("cmdInsertPhones", "PC_InsertPhones Me")
+
+    comp.CodeModule.AddFromString code
+
+    MsgBox "Phone Cleaner form created." & vbCrLf & _
+           "Run the PhoneCleaner macro to open it.", vbInformation, "Phone Cleaner"
+End Sub
+
+' ---------------------------------------------------------------------
+' Button actions (called by the form)
+' ---------------------------------------------------------------------
+Public Sub PC_Clean(frm As Object)
+    Dim phones As Collection
+    Dim missed As Long
+    Dim msg As String
+
+    Set phones = ExtractPhones(frm.Controls("txtInput").Text, missed)
+
+    If phones.Count = 0 Then
+        SetStatus frm, "No U.S. phone numbers found in the input box."
+        Exit Sub
+    End If
+
+    frm.Controls("txtPhones").Text = JoinCollection(phones)
+
+    msg = phones.Count & " phone number(s) cleaned."
+    If missed > 0 Then
+        msg = msg & " " & missed & " line(s) had no recognizable number. Review the input."
+    Else
+        msg = msg & " " & DEFAULT_STATUS
+    End If
+    SetStatus frm, msg
+End Sub
+
+Public Sub PC_Clear(frm As Object)
+    frm.Controls("txtInput").Text = ""
+    frm.Controls("txtPhones").Text = ""
+    SetStatus frm, DEFAULT_STATUS
+End Sub
+
+Public Sub PC_InsertPhones(frm As Object)
+    InsertBulletList frm, frm.Controls("txtPhones").Text, "phone number(s)"
+End Sub
+
+' ---------------------------------------------------------------------
+' Inserts a bulleted list at the cursor. If the cursor is on a line with
+' text (such as a section heading), the list goes on the line below it.
+' ---------------------------------------------------------------------
+Private Sub InsertBulletList(frm As Object, ByVal listText As String, ByVal label As String)
+    Dim parts() As String
+    Dim i As Long
+    Dim lineText As String
+    Dim joined As String
+    Dim itemCount As Long
+    Dim para As Range
+    Dim rng As Range
+    Dim paraText As String
+    Dim undoStarted As Boolean
+
+    listText = Replace(listText, vbCrLf, vbLf)
+    listText = Replace(listText, vbCr, vbLf)
+    parts = Split(listText, vbLf)
+
+    For i = LBound(parts) To UBound(parts)
+        lineText = Trim$(parts(i))
+        If Len(lineText) > 0 Then
+            If Len(joined) > 0 Then joined = joined & vbCr
+            joined = joined & lineText
+            itemCount = itemCount + 1
+        End If
+    Next i
+
+    If itemCount = 0 Then
+        SetStatus frm, "Nothing to insert. Clean the numbers first."
+        Exit Sub
+    End If
+
+    If Documents.Count = 0 Then
+        SetStatus frm, "Open a document first."
+        Exit Sub
+    End If
+
+    On Error Resume Next
+    Application.UndoRecord.StartCustomRecord "Insert " & label
+    undoStarted = (Err.Number = 0)
+    On Error GoTo 0
+
+    Set para = Selection.Paragraphs(1).Range
+    paraText = Replace(Replace(para.Text, vbCr, ""), Chr(7), "")
+
+    If Len(Trim$(paraText)) > 0 Then
+        para.InsertParagraphAfter
+        Set para = para.Paragraphs(para.Paragraphs.Count).Range
+    End If
+
+    Set rng = para.Duplicate
+    rng.Collapse wdCollapseStart
+    rng.Text = joined
+    rng.Style = wdStyleListBullet
+
+    rng.Collapse wdCollapseEnd
+    rng.Select
+
+    If undoStarted Then Application.UndoRecord.EndCustomRecord
+
+    SetStatus frm, itemCount & " " & label & " inserted."
+End Sub
+
+' ---------------------------------------------------------------------
+' Phone parsing (U.S./NANP 10-digit numbers)
+' Recognizes: 2107900232, 210-790-0232, 210.790.0232, 210 790 0232,
+'             (210) 790-0232, (210)790-0232, 1-210-790-0232, +1 210 790 0232
+' Ignores dates, percentages, and other digit groups.
+' ---------------------------------------------------------------------
+Private Function ExtractPhones(ByVal s As String, ByRef missedLines As Long) As Collection
+    Dim result As New Collection
+    Dim lines() As String
+    Dim i As Long
+    Dim lineText As String
+    Dim p As Long
+    Dim endPos As Long
+    Dim digits As String
+    Dim formatted As String
+    Dim foundOnLine As Boolean
+
+    missedLines = 0
+    s = Replace(s, vbCrLf, vbLf)
+    s = Replace(s, vbCr, vbLf)
+    s = Replace(s, ChrW(160), " ")
+    lines = Split(s, vbLf)
+
+    For i = LBound(lines) To UBound(lines)
+        lineText = lines(i)
+        foundOnLine = False
+        p = 1
+
+        Do While p <= Len(lineText)
+            endPos = 0
+            If Mid$(lineText, p, 1) Like "[0-9(+]" Then
+                endPos = MatchPhoneAt(lineText, p, digits)
+            End If
+
+            If endPos > 0 Then
+                formatted = "(" & Left$(digits, 3) & ") " & Mid$(digits, 4, 3) & "-" & Right$(digits, 4)
+                On Error Resume Next
+                result.Add formatted, formatted   ' key prevents duplicates
+                On Error GoTo 0
+                foundOnLine = True
+                p = endPos
+            Else
+                p = p + 1
+            End If
+        Loop
+
+        If Not foundOnLine And Len(Trim$(lineText)) > 0 Then missedLines = missedLines + 1
+    Next i
+
+    Set ExtractPhones = result
+End Function
+
+' Returns the position just after the match, or 0 if no match.
+Private Function MatchPhoneAt(ByVal s As String, ByVal startPos As Long, ByRef digits As String) As Long
+    Dim p As Long
+    Dim endPos As Long
+
+    ' Must not start in the middle of a longer number
+    If startPos > 1 Then
+        If Mid$(s, startPos - 1, 1) Like "#" Then Exit Function
+    End If
+
+    ' Try without a country code
+    endPos = MatchCore(s, startPos, digits)
+    If endPos > 0 Then
+        MatchPhoneAt = endPos
+        Exit Function
+    End If
+
+    ' Try with a leading +1 or 1
+    p = startPos
+    If Mid$(s, p, 1) = "+" Then p = p + 1
+    If Mid$(s, p, 1) <> "1" Then Exit Function
+    p = SkipSeps(s, p + 1, 1)
+    MatchPhoneAt = MatchCore(s, p, digits)
+End Function
+
+Private Function MatchCore(ByVal s As String, ByVal p As Long, ByRef digits As String) As Long
+    Dim area As String
+    Dim exch As String
+    Dim lineNum As String
+
+    If Mid$(s, p, 1) = "(" Then
+        area = TakeDigits(s, p + 1, 3)
+        If Len(area) <> 3 Then Exit Function
+        If Mid$(s, p + 4, 1) <> ")" Then Exit Function
+        p = p + 5
+    Else
+        area = TakeDigits(s, p, 3)
+        If Len(area) <> 3 Then Exit Function
+        p = p + 3
+    End If
+
+    p = SkipSeps(s, p, 2)
+    exch = TakeDigits(s, p, 3)
+    If Len(exch) <> 3 Then Exit Function
+    p = p + 3
+
+    p = SkipSeps(s, p, 1)
+    lineNum = TakeDigits(s, p, 4)
+    If Len(lineNum) <> 4 Then Exit Function
+    p = p + 4
+
+    ' Must not be followed by more digits
+    If p <= Len(s) Then
+        If Mid$(s, p, 1) Like "#" Then Exit Function
+    End If
+
+    ' U.S. area codes and exchanges cannot start with 0 or 1
+    If Not (Left$(area, 1) Like "[2-9]") Then Exit Function
+    If Not (Left$(exch, 1) Like "[2-9]") Then Exit Function
+
+    digits = area & exch & lineNum
+    MatchCore = p
+End Function
+
+Private Function TakeDigits(ByVal s As String, ByVal p As Long, ByVal n As Long) As String
+    Dim chunk As String
+    Dim i As Long
+
+    If p < 1 Or p + n - 1 > Len(s) Then Exit Function
+    chunk = Mid$(s, p, n)
+    For i = 1 To n
+        If Not Mid$(chunk, i, 1) Like "#" Then Exit Function
+    Next i
+    TakeDigits = chunk
+End Function
+
+Private Function SkipSeps(ByVal s As String, ByVal p As Long, ByVal maxCount As Long) As Long
+    Dim n As Long
+    Do While n < maxCount And p <= Len(s)
+        If InStr(" -.", Mid$(s, p, 1)) = 0 Then Exit Do
+        p = p + 1
+        n = n + 1
+    Loop
+    SkipSeps = p
+End Function
+
+' ---------------------------------------------------------------------
+' Helpers
+' ---------------------------------------------------------------------
+Private Function JoinCollection(c As Collection) As String
+    Dim v As Variant
+    Dim s As String
+    For Each v In c
+        If Len(s) > 0 Then s = s & vbCrLf
+        s = s & v
+    Next v
+    JoinCollection = s
+End Function
+
+Private Sub SetStatus(frm As Object, ByVal msg As String)
+    frm.Controls("lblStatus").Caption = msg
+End Sub
+
+Private Function EventSub(ByVal ctlName As String, ByVal body As String) As String
+    EventSub = "Private Sub " & ctlName & "_Click()" & vbCrLf & _
+               "    " & body & vbCrLf & _
+               "End Sub" & vbCrLf & vbCrLf
+End Function
+
+Private Sub AddLabel(frm As Object, ByVal nm As String, ByVal cap As String, _
+                     ByVal l As Single, ByVal t As Single, ByVal w As Single, ByVal h As Single)
+    Dim c As Object
+    Set c = frm.Controls.Add("Forms.Label.1", nm)
+    c.Caption = cap
+    c.Left = l: c.Top = t: c.Width = w: c.Height = h
+    c.WordWrap = True
+End Sub
+
+Private Sub AddTextBox(frm As Object, ByVal nm As String, _
+                       ByVal l As Single, ByVal t As Single, ByVal w As Single, ByVal h As Single)
+    Dim c As Object
+    Set c = frm.Controls.Add("Forms.TextBox.1", nm)
+    c.Left = l: c.Top = t: c.Width = w: c.Height = h
+    c.MultiLine = True
+    c.WordWrap = True
+    c.EnterKeyBehavior = True
+    c.ScrollBars = 2 ' vertical
+End Sub
+
+Private Sub AddButton(frm As Object, ByVal nm As String, ByVal cap As String, _
+                      ByVal l As Single, ByVal t As Single, ByVal w As Single, ByVal h As Single)
+    Dim c As Object
+    Set c = frm.Controls.Add("Forms.CommandButton.1", nm)
+    c.Caption = cap
+    c.Left = l: c.Top = t: c.Width = w: c.Height = h
+End Sub
